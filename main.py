@@ -15,7 +15,7 @@ from aiogram.types import Message, BufferedInputFile
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # Вшиваем токен намертво, чтобы хостинг больше никогда не писал "Токен не найден"
-TOKEN = "API-TOKEN"
+TOKEN = os.getenv("API_TOKEN") or os.getenv("BOT_TOKEN")
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
