@@ -3,6 +3,7 @@ import logging
 import io
 import os
 import sys
+import re
 from io import BytesIO
 
 # Базовые библиотеки
@@ -11,15 +12,19 @@ from PIL import Image, ImageDraw
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Перехватываем ошибки импорта OpenCV, так как на хостинге он ставится долго
+# Перехватываем ошибки импорта OpenCV и Tesseract
 try:
     import cv2
     import numpy as np
+    import pytesseract  # Библиотека для распознавания текста
 
-    logging.info("✅ Успешный импорт OpenCVcontrib")
-except ModuleNotFoundError:
-    logging.critical("💥 ОШИБКА: Библиотека 'opencv-contrib-python-headless' не установлена! Проверьте requirements.txt")
+    logging.info("✅ Успешный импорт OpenCV и PyTesseract")
+except ModuleNotFoundError as e:
+    logging.critical(f"💥 ОШИБКА: Не установлена библиотека! {e}")
     sys.exit(1)
+
+# ЕСЛИ ВЫ НА WINDOWS: раскомментируйте строку ниже и укажите путь к tesseract.exe
+# pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, BufferedInputFile
@@ -36,7 +41,39 @@ dp = Dispatcher()
 TEMPLATE_PATH = "maket.jpg"
 
 
-# Твой алгоритм генерации QR-кода на макете
+# --- ИИ ДЕКОДЕРЫ ---
+# 1. Движок WeChat для QR-кодов
+wechat_detector = cv2.wechat_qrcode_WeChatQRCode()
+
+# 2. Функция распознавания 12-значного CLG текста через Tesseract OCR
+def extract_clg_text_from_image(photo_bytes: bytes) -> str:
+    try:
+        # Открываем изображение через PIL и переводим в оттенки серого для лучшего распознавания
+        img = Image.open(io.BytesIO(photo_bytes)).convert('L')
+        
+        # Увеличиваем контрастность, чтобы текст был четче
+        img = img.point(lambda x: 0 if x < 128 else 255, '1')
+
+        # Запускаем поиск только цифр (оптимизируем под конфигурацию Tesseract)
+        custom_config = r'--oem 3 --psm 11 -c tessedit_char_whitelist=0123456789'
+        text = pytesseract.image_to_string(img, config=custom_config)
+        
+        # Удаляем все пробелы и переносы, ищем 12 цифр подряд
+        cleaned_text = re.sub(r'\s+', '', text)
+        match = re.search(r'\d{12}', cleaned_text)
+        
+        if match:
+            code = match.group(0)
+            # Форматируем в красивый вид: 012 345 678 901
+            return f"{code[:3]} {code[3:6]} {code[6:9]} {code[9:]}"
+        
+        return "Не удалось считать цифры (CLG)"
+    except Exception as e:
+        logging.error(f"Ошибка при работе Tesseract OCR: {e}")
+        return "Ошибка распознавания текста"
+
+
+# Твой рабочий алгоритм генерации QR-кода на макете
 def generate_qr_on_template(data: str, output_size=1200) -> io.BytesIO:
     if not os.path.exists(TEMPLATE_PATH):
         raise FileNotFoundError(f"Файл макета '{TEMPLATE_PATH}' не найден!")
@@ -77,30 +114,14 @@ def generate_qr_on_template(data: str, output_size=1200) -> io.BytesIO:
     return output_buffer
 
 
-# ИНИЦИАЛИЗАЦИЯ ИИ-ДЕКОДЕРА WECHAT (делается один раз при запуске бота)
-# Это сверхмощная нейросеть, встроенная в OpenCVcontrib
-wechat_detector = cv2.wechat_qrcode_WeChatQRCode()
-
-
-# Функция декодирования через ИИ-движок WeChat
 def decode_qr_from_photo(photo_bytes: bytes) -> str:
     try:
-        # Превращаем байты в формат, понятный OpenCV
         nparr = np.frombuffer(photo_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
         if img is None:
             return ""
-
-        # Находим и декодируем QR-код с помощью нейросети
-        # res — это список найденных строк (WeChat видит все коды в кадре)
         res, points = wechat_detector.detectAndDecode(img)
-
-        # Если хотя бы один код найден, берем первый
-        if res:
-            return res[0]
-        else:
-            return ""
+        return res[0] if res else ""
     except Exception as e:
         logging.error(f"Ошибка внутри ИИ-декодера WeChat: {e}")
         return ""
@@ -109,15 +130,15 @@ def decode_qr_from_photo(photo_bytes: bytes) -> str:
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "👋 Привет! Бот обновлен до уровня ИИ-сканера.\n\n"
-        "Я использую сверхмощный нейросетевой движок WeChat для распознавания QR-кодов. "
-        "Просто отправь мне фото бирки под любым углом и с любым освещением, я считаю код и сделаю кастомный QR!"
+        "👋 Привет! Бот обновлен.\n\n"
+        "Теперь я не только создаю кастомный QR-код по вашей технологии, "
+        "но и параллельно считываю 12-значный CLG код прямо с текста на фотографии бирки!"
     )
 
 
 @dp.message(F.photo)
 async def handle_photo(message: Message):
-    status_msg = await message.answer("📥 Принял фото. Запускаю ИИ-сканер для поиска QR-кода...")
+    status_msg = await message.answer("📥 Фото получено. Сканирую QR-код и распознаю цифры...")
 
     try:
         photo = message.photo[-1]
@@ -125,27 +146,30 @@ async def handle_photo(message: Message):
         await bot.download(photo, destination=file_in_io)
         photo_bytes = file_in_io.getvalue()
 
-        # Мощное ИИ-декодирование в фоновом потоке
         loop = asyncio.get_running_loop()
+        
+        # 1. Параллельно запускаем считывание QR-кода и распознавание напечатанного CLG-текста
         detected_link = await loop.run_in_executor(None, decode_qr_from_photo, photo_bytes)
+        clg_text_code = await loop.run_in_executor(None, extract_clg_text_from_image, photo_bytes)
 
         if not detected_link:
             await status_msg.edit_text(
-                "❌ К сожалению, даже ИИ-сканер не смог найти QR-код на этом фото.\n\n"
-                "Это значит, что изображение слишком размыто, код полностью засвечен бликом от лампы или перекрыт грязью."
+                f"❌ QR-код не найден.\n\n"
+                f"🔢 **Считанные цифры с бирки:** `{clg_text_code}`\n\n"
+                f"Попробуйте сделать фото более четким и под прямым углом."
             )
             return
 
-        await status_msg.edit_text(
-            f"🔍 ИИ-сканер успешно распознал код!\nСсылка: `{detected_link}`\n\n⏳ Создаю кастомный QR...")
-
-        # Генерация нового QR
+        # 2. Если QR найден, генерируем новый кастомный макет
         result_buffer = await loop.run_in_executor(None, generate_qr_on_template, detected_link)
-
         document = BufferedInputFile(result_buffer.read(), filename="CUSTOM_QR.png")
+        
+        # Отправляем готовый кастомный QR и распознанные цифры в красивом формате
         await message.reply_document(
             document=document,
-            caption=f"✅ Готово!\nСсылка из бирки: `{detected_link}`"
+            caption=f"✅ **Все данные успешно считаны!**\n\n"
+                    f"🔢 **Код с бирки:** `{clg_text_code}`\n"
+                    f"🔗 **Ссылка из QR:** `{detected_link}`"
         )
         await status_msg.delete()
 
@@ -162,7 +186,7 @@ async def handle_other(message: Message):
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("🚀 Сверхмощный ИИ-бот на WeChatQRCode запущен!")
+    logging.info("🚀 Бот (QR-генератор + Text OCR) запущен!")
     await dp.start_polling(bot)
 
 
