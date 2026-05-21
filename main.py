@@ -3,7 +3,7 @@ import logging
 import io
 import os
 import sys
-import re  # Добавили для поиска регулярными выражениями
+import re
 from io import BytesIO
 
 # Базовые библиотеки
@@ -12,13 +12,13 @@ from PIL import Image, ImageDraw
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Перехватываем ошибки импорта OpenCV и EasyOCR
+# Перехватываем ошибки импорта
 try:
     import cv2
     import numpy as np
-    import easyocr  # Добавили OCR библиотеку
+    import pytesseract  # Используем Tesseract вместо EasyOCR
 
-    logging.info("✅ Успешный импорт OpenCVcontrib и EasyOCR")
+    logging.info("✅ Успешный импорт OpenCVcontrib и PyTesseract")
 except ModuleNotFoundError as e:
     logging.critical(f"💥 ОШИБКА: Не установлена библиотека! {e}. Проверьте requirements.txt")
     sys.exit(1)
@@ -37,10 +37,8 @@ dp = Dispatcher()
 
 TEMPLATE_PATH = "maket.jpg"
 
-# ИНИЦИАЛИЗАЦИЯ ДВИЖКОВ (делается один раз при запуске)
+# ИНИЦИАЛИЗАЦИЯ ДВИЖКА QR
 wechat_detector = cv2.wechat_qrcode_WeChatQRCode()
-# Инициализируем распознавание английского текста и цифр (работает быстрее, чем мульти can)
-ocr_reader = easyocr.Reader(['en'], gpu=False)  # Если на сервере есть GPU, поставь True
 
 
 def generate_qr_on_template(data: str, output_size=1200) -> io.BytesIO:
@@ -84,7 +82,6 @@ def generate_qr_on_template(data: str, output_size=1200) -> io.BytesIO:
 
 
 def decode_qr_from_photo(img: np.ndarray) -> str:
-    """Сканирование QR-кода"""
     try:
         res, points = wechat_detector.detectAndDecode(img)
         return res[0] if res else ""
@@ -94,40 +91,46 @@ def decode_qr_from_photo(img: np.ndarray) -> str:
 
 
 def extract_clg_code(img: np.ndarray) -> str:
-    """Сканирование текста и поиск 12-значного CLG кода"""
+    """Улучшенное распознавание 12-значного CLG кода"""
     try:
-        # Извлекаем весь текст с картинки
-        results = ocr_reader.readtext(img, detail=0)
-        full_text = " ".join(results)
+        # Предобработка картинки для улучшения читаемости текста
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         
-        # Регулярное выражение ищет ровно 12 цифр, между которыми могут быть пробелы или дефисы
-        # Примеры: "307 667 487 937", "CLG307667487937", "307-667-487-937"
+        # Увеличиваем контраст (бинаризация)
+        thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+
+        # Конфигурация Tesseract: искать только цифры (задаем белый список символов)
+        custom_config = r'--psm 11 -c tessedit_char_whitelist=0123456789'
+        full_text = pytesseract.image_to_string(thresh, config=custom_config)
+        
+        logging.info(f"Считанный текст из Tesseract: {full_text}")
+
+        # Ищем последовательность из 12 цифр (с учетом возможных пробелов между ними)
         match = re.search(r'(?:\d[\s-]*){12}', full_text)
         
         if match:
-            # Очищаем найденный код от пробелов и тире, оставляя только 12 цифр
             clean_code = re.sub(r'\D', '', match.group(0))
-            # Форматируем для красоты по 3 цифры: "307 667 487 937"
+            # Красиво форматируем по 3 цифры: "307 667 487 937"
             formatted_code = f"{clean_code[:3]} {clean_code[3:6]} {clean_code[6:9]} {clean_code[9:]}"
             return formatted_code
+            
         return ""
     except Exception as e:
-        logging.error(f"Ошибка внутри ИИ-распознавания текста: {e}")
+        logging.error(f"Ошибка внутри Tesseract OCR: {e}")
         return ""
 
 
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "👋 Привет! Бот обновлен.\n\n"
-        "Я умею считывать **QR-коды** и находить **12-значные CLG-коды** прямо на фотографии бирки.\n"
-        "Просто отправь мне фото!"
+        "👋 Привет! Бот готов к работе.\n\n"
+        "Отправь мне фото бирки, я считаю QR-код и 12-значный CLG код."
     )
 
 
 @dp.message(F.photo)
 async def handle_photo(message: Message):
-    status_msg = await message.answer("📥 Принял фото. Запускаю сканирование кода и текста...")
+    status_msg = await message.answer("📥 Принял фото. Сканирую данные...")
 
     try:
         photo = message.photo[-1]
@@ -135,7 +138,6 @@ async def handle_photo(message: Message):
         await bot.download(photo, destination=file_in_io)
         photo_bytes = file_in_io.getvalue()
 
-        # Декодируем байты в OpenCV формат один раз для обеих функций
         nparr = np.frombuffer(photo_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
@@ -145,41 +147,49 @@ async def handle_photo(message: Message):
 
         loop = asyncio.get_running_loop()
         
-        # Запускаем распознавание QR и текста параллельно в фоновом потоке
+        # Запускаем распознавание параллельно
         detected_link = await loop.run_in_executor(None, decode_qr_from_photo, img)
         detected_clg = await loop.run_in_executor(None, extract_clg_code, img)
 
-        # Формируем текст ответа
+        # Собираем текст ответа (Кавычки ` убраны!)
         response_text = ""
         if detected_clg:
-            response_text += f"🔢 **Найден CLG-код:** `{detected_clg}`\n"
+            response_text += f"🔢 **Найден CLG-код:** {detected_clg}\n"
         else:
-            response_text += "🔢 **CLG-код:** Не удалось распознать текст.\n"
+            response_text += "🔢 **CLG-код:** Не удалось распознать (попробуйте сделать фото ближе/четче).\n"
 
         if detected_link:
-            response_text += f"🔍 **QR-код:** Ссылка распознана!\n\n⏳ Создаю кастомный QR..."
+            response_text += f"🔗 **QR-код:** {detected_link}\n\n⏳ Создаю макет..."
             await status_msg.edit_text(response_text)
             
-            # Генерация нового QR на основе ссылки
+            # Генерация нового QR
             result_buffer = await loop.run_in_executor(None, generate_qr_on_template, detected_link)
             document = BufferedInputFile(result_buffer.read(), filename="CUSTOM_QR.png")
             
-            caption_text = f"✅ Готово!\n🔢 CLG-код: `{detected_clg if detected_clg else 'не найден'}`\n🔗 Ссылка: `{detected_link}`"
+            # Финальный текст под файлом без кавычек в ссылке
+            clg_str = detected_clg if detected_clg else "не найден"
+            caption_text = f"✅ Готово!\n\n🔢 CLG-код: {clg_str}\n🔗 Ссылка: {detected_link}"
+            
             await message.reply_document(document=document, caption=caption_text)
             await status_msg.delete()
         else:
-            response_text += "\n❌ **QR-код:** Не найден на фото."
-            # Если QR не найден, но CLG код есть — просто отдаем его текстом
             if detected_clg:
-                await status_msg.edit_text(f"✅ Нашел текстовый код!\n\n🔢 **CLG-код:** `{detected_clg}`\n\n(QR-код считать не удалось)")
+                await status_msg.edit_text(
+                    f"✅ Код успешно найден!\n\n"
+                    f"🔢 **CLG-код:** {detected_clg}\n\n"
+                    f"⚠️ QR-код считать не удалось (возможно, он смазан)."
+                )
             else:
-                await status_msg.edit_text("❌ Не удалось найти ни QR-код, ни 12-значный текстовый код.")
+                await status_msg.edit_text("❌ Не удалось считать ни QR-код, ни текстовый 12-значный код.")
 
     except Exception as e:
         logging.error(f"Ошибка при обработке фото: {e}")
         await message.answer("💥 Произошла ошибка при обработке изображения на сервере.")
         if 'status_msg' in locals():
-            await status_msg.delete()
+            try:
+                await status_msg.delete()
+            except:
+                pass
 
 
 @dp.message()
@@ -189,7 +199,7 @@ async def handle_other(message: Message):
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("🚀 Бот со сканером QR и текста запущен!")
+    logging.info("🚀 Обновленный бот успешно запущен!")
     await dp.start_polling(bot)
 
 
