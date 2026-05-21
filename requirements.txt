@@ -2,4 +2,3 @@ aiogram
 qrcode
 pillow
 python-dotenv
-qreader
