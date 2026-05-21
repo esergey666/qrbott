@@ -2,5 +2,4 @@ aiogram
 qrcode
 pillow
 python-dotenv
-numpy
 zxing-cpp
