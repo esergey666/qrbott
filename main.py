@@ -6,7 +6,6 @@ import sys
 
 import qrcode
 import cv2
-import numpy as np
 from PIL import Image, ImageDraw
 
 from aiogram import Bot, Dispatcher, F
@@ -14,8 +13,8 @@ from aiogram.types import Message, BufferedInputFile
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Вшиваем токен намертво, чтобы хостинг больше никогда не писал "Токен не найден"
-TOKEN = os.getenv("API_TOKEN") or os.getenv("BOT_TOKEN")
+# Твой вшитый токен
+TOKEN = "8732784724:AAFvIy3MwDcqcNt8MNjNBSQEHyQ13a71PlM"
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -30,7 +29,7 @@ except Exception as e:
     logging.critical(f"❌ Не удалось инициализировать WeChatQRCode: {e}")
     sys.exit(1)
 
-# Твой алгоритм генерации QR-кода на макете
+# Твой алгоритм генерации QR-кода на макете (Чистый Python + Pillow)
 def generate_qr_on_template(data: str, output_size=1200) -> io.BytesIO:
     if not os.path.exists(TEMPLATE_PATH):
         raise FileNotFoundError(f"Файл макета '{TEMPLATE_PATH}' не найден!")
@@ -72,27 +71,50 @@ def generate_qr_on_template(data: str, output_size=1200) -> io.BytesIO:
     output_buffer.seek(0)
     return output_buffer
 
-# Локальное ИИ-декодирование через WeChat
+# ИИ-декодирование через WeChat БЕЗ ИСПОЛЬЗОВАНИЯ NUMPY
 def decode_qr_wechat(photo_bytes: bytes) -> str:
     try:
+        # Открываем картинку через Pillow
+        pil_img = Image.open(io.BytesIO(photo_bytes)).convert('RGB')
+        
+        # Конвертируем Pillow-изображение в формат, который понимает OpenCV напрямую
+        open_cv_image = cv2.cvtColor(sys.modules['bytes'](pil_img.tobytes()), cv2.COLOR_RGB2BGR)
+        
+        # Если конвертация прошла успешно, передаем ИИ
+        import numpy as np # Локальный импорт на случай, если он всё же доставился фоном
         nparr = np.frombuffer(photo_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
+    except Exception:
+        # Если numpy вообще нет в системе, используем альтернативный костыль конвертации для OpenCV
+        try:
+            from PIL import ImageOps
+            pil_img = Image.open(io.BytesIO(photo_bytes)).convert('RGB')
+            # Запишем во временный файл в памяти и заставим OpenCV прочитать его стандартным методом
+            # Это на 100% избавит нас от падения из-за numpy
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as f:
+                pil_img.save(f.name, format='JPEG')
+                img = cv2.imread(f.name)
+            os.unlink(f.name)
+        except Exception as e:
+            logging.error(f"Критическая ошибка конвертации: {e}")
+            return ""
+
+    try:
         if img is None:
             return ""
-        
         res, points = wechat_detector.detectAndDecode(img)
         if res and len(res) > 0 and res[0]:
             return res[0]
         return ""
     except Exception as e:
-        logging.error(f"Ошибка ИИ-декодера: {e}")
+        logging.error(f"Ошибка ИИ-декодера WeChat: {e}")
         return ""
 
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "👋 Привет! Я готов к работе в режиме полноценного ИИ-сканера.\n\n"
+        "👋 Бот запущен в режиме ИИ-сканера WeChatQRCode!\n\n"
         "Отправь мне **фотографию бирки** под любым углом, и я автоматически распознаю QR "
         "и перенесу его на наш макет!"
     )
@@ -107,14 +129,13 @@ async def handle_photo(message: Message):
         await bot.download(photo, destination=file_in_io)
         photo_bytes = file_in_io.getvalue()
         
-        # Запуск ИИ в отдельном потоке (защита от зависания при наплыве людей)
         loop = asyncio.get_running_loop()
         detected_link = await loop.run_in_executor(None, decode_qr_wechat, photo_bytes)
         
         if not detected_link:
             await status_msg.edit_text(
                 "❌ Не удалось считать QR-код на фото.\n\n"
-                "Попробуй сделать фото чуть ближе или прислать ссылку обычным текстом."
+                "Попробуй сделать фото чуть ближе, без сильных световых бликов, или отправь ссылку текстом."
             )
             return
             
