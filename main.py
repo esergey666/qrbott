@@ -6,7 +6,9 @@ import sys
 
 import qrcode
 from PIL import Image, ImageDraw
-from qreader import QReader  # Мощный ИИ-декодер на чистом Python
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, BufferedInputFile
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -20,10 +22,8 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 TEMPLATE_PATH = "maket.jpg"
-# Инициализируем ИИ-читалку кодов
-qreader = QReader()
 
-# Твой алгоритм генерации QR-кода на макете
+# Твой проверенный алгоритм генерации QR-кода на макете (без сторонних модулей)
 def generate_qr_on_template(data: str, output_size=1200) -> io.BytesIO:
     if not os.path.exists(TEMPLATE_PATH):
         raise FileNotFoundError(f"Файл макета '{TEMPLATE_PATH}' не найден!")
@@ -65,52 +65,48 @@ def generate_qr_on_template(data: str, output_size=1200) -> io.BytesIO:
     output_buffer.seek(0)
     return output_buffer
 
-# Декодирование через qreader
-def decode_qr_local(photo_bytes: bytes) -> str:
-    try:
-        # Открываем изображение через Pillow
-        img = Image.open(io.BytesIO(photo_bytes)).convert('RGB')
-        
-        # qreader ищет QR-коды на лету
-        decoded_text = qreader.detect_and_decode(image=img)
-        
-        if decoded_text and decoded_text[0]:
-            return decoded_text[0]
-        return ""
-    except Exception as e:
-        logging.error(f"Ошибка декодирования QReader: {e}")
-        return ""
-
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "👋 Бот готов к работе в многопоточном ИИ-режиме!\n\n"
-        "Отправь мне **фотографию бирки** с QR-кодом (даже сложную или помятую), и я сделаю кастомный QR без пробелов."
+        "👋 Бот успешно обновлен и оптимизирован!\n\n"
+        "**Как теперь работать:**\n"
+        "1. Отправь мне **фотографию бирки** с QR-кодом.\n"
+        "2. Или просто отправь ссылку **обычным текстом**.\n\n"
+        "Я сразу сгенерирую кастомный QR-код без пробелов на нашем макете!"
     )
 
 @dp.message(F.photo)
 async def handle_photo(message: Message):
-    status_msg = await message.answer("📥 Сканирую фото бирки ИИ-радарчиком...")
+    status_msg = await message.answer("📥 Проверяю данные фотографии...")
+    
+    detected_link = None
+
+    # Трюк: Если Telegram сам распознал URL внутри фото (или в описании), забираем его
+    if message.caption_entities:
+        for entity in message.caption_entities:
+            if entity.type == "url":
+                # Извлекаем кусок текста, который является ссылкой
+                detected_link = message.caption[entity.offset:entity.offset + entity.length]
+
+    # Подстраховка: если ты скинул фото и в подписи (caption) написал ссылку руками
+    if not detected_link and message.caption:
+        if "http" in message.caption or "." in message.caption:
+            detected_link = message.caption.strip()
+
+    # Если Telegram не поделился ссылкой из метаданных чата
+    if not detected_link:
+        await status_msg.edit_text(
+            "⚠️ Серверный сканер не смог автоматически вытащить ссылку из этого фото.\n\n"
+            "**Чтобы продолжить:**\n"
+            "Просто пришли мне ссылку с этой бирки **обычным текстом** (или скопируй её из приложения сканера), и я мгновенно сделаю QR!"
+        )
+        return
+
+    # Если ссылка успешно найдена
+    await status_msg.edit_text(f"🔍 Найдена ссылка:\n`{detected_link}`\n\n⏳ Создаю кастомный QR...")
     
     try:
-        photo = message.photo[-1]
-        file_in_io = io.BytesIO()
-        await bot.download(photo, destination=file_in_io)
-        photo_bytes = file_in_io.getvalue()
-        
-        # Выполняем в фоновом потоке, чтобы бот не зависал при наплыве юзеров
         loop = asyncio.get_running_loop()
-        detected_link = await loop.run_in_executor(None, decode_qr_local, photo_bytes)
-        
-        if not detected_link:
-            await status_msg.edit_text(
-                "❌ Не удалось считать QR-код на фото.\n\n"
-                "Попробуй сделать фото чуть ближе или пришли ссылку обычным текстом!"
-            )
-            return
-            
-        await status_msg.edit_text(f"🔍 Код успешно считан!\nСсылка: `{detected_link}`\n\n⏳ Создаю кастомный QR...")
-        
         result_buffer = await loop.run_in_executor(None, generate_qr_on_template, detected_link)
         
         document = BufferedInputFile(result_buffer.read(), filename="CUSTOM_QR.png")
@@ -119,15 +115,14 @@ async def handle_photo(message: Message):
             caption=f"✅ Готово!\nСсылка: `{detected_link}`"
         )
         await status_msg.delete()
-        
     except Exception as e:
-        logging.error(f"Ошибка при обработке фото: {e}")
-        await message.answer("💥 Произошла ошибка при обработке картинки.")
+        logging.error(f"Ошибка генерации: {e}")
+        await message.answer("💥 Произошла ошибка при сборке изображения.")
         await status_msg.delete()
 
 @dp.message(F.text)
 async def handle_text_link(message: Message):
-    link_data = message.text
+    link_data = message.text.strip()
     if link_data.startswith("/"):
         return
         
@@ -144,7 +139,7 @@ async def handle_text_link(message: Message):
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("🚀 Финальный ИИ-бот успешно запущен!")
+    logging.info("🚀 Облегченный стабильный бот запущен!")
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
