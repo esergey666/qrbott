@@ -1,4 +1,5 @@
-aiogram==3.7.0
-qrcode[pil]==7.4.2
-Pillow==10.3.0
-python-dotenv==1.0.1
+aiogram
+qrcode
+pillow
+python-dotenv
+opencv-contrib-python-headless
