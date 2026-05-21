@@ -4,6 +4,8 @@ import io
 import os
 import sys
 import re
+from io import BytesIO
+import aiohttp  # Легкие асинхронные запросы вместо тяжелого OCR
 
 # Базовые библиотеки
 import qrcode
@@ -14,9 +16,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 try:
     import cv2
     import numpy as np
-    import easyocr
-
-    logging.info("✅ Успешный импорт OpenCVcontrib и EasyOCR")
+    logging.info("✅ Успешный импорт OpenCVcontrib")
 except ModuleNotFoundError as e:
     logging.critical(f"💥 ОШИБКА: Не установлена библиотека! {e}. Проверьте requirements.txt")
     sys.exit(1)
@@ -35,9 +35,8 @@ dp = Dispatcher()
 
 TEMPLATE_PATH = "maket.jpg"
 
-# ИНИЦИАЛИЗАЦИЯ ДВИЖКОВ (один раз при старте)
+# ИНИЦИАЛИЗАЦИЯ ДВИЖКА QR (потребляет мало памяти)
 wechat_detector = cv2.wechat_qrcode_WeChatQRCode()
-ocr_reader = easyocr.Reader(['en'], gpu=False)
 
 
 def generate_qr_on_template(data: str, output_size=1200) -> io.BytesIO:
@@ -80,85 +79,58 @@ def generate_qr_on_template(data: str, output_size=1200) -> io.BytesIO:
     return output_buffer
 
 
-def scan_tag_data(img: np.ndarray):
-    """
-    Безопасный поиск QR и CLG-кода с защитой от вылетов геометрии.
-    """
-    detected_link = ""
-    detected_clg = ""
-    
-    # 1. Распознаем QR-код
+def decode_qr_from_photo(img: np.ndarray) -> str:
     try:
         res, points = wechat_detector.detectAndDecode(img)
-        if res:
-            detected_link = res[0]
-            logging.info(f"QR код успешно найден движком WeChat: {detected_link}")
+        return res[0] if res else ""
     except Exception as e:
-        logging.error(f"Ошибка при работе WeChatQRCode: {e}")
-        points = None
+        logging.error(f"Ошибка WeChat: {e}")
+        return ""
 
-    # 2. Пробуем снайперски вырезать зону над QR-кодом для поиска CLG
-    if detected_link and points is not None and len(points) > 0:
-        try:
-            box = points[0]
-            img_h, img_w = img.shape[:2]
 
-            x_min = int(max(0, min(box[:, 0])))
-            x_max = int(min(img_w, max(box[:, 0])))
-            y_min = int(max(0, min(box[:, 1])))
-            
-            qr_width = x_max - x_min
-            qr_height = int(max(box[:, 1]) - y_min)
-            
-            # Строгие безопасные границы вырезки
-            crop_y_min = max(0, y_min - int(qr_height * 0.9))
-            crop_y_max = max(0, y_min - int(qr_height * 0.05))
-            crop_x_min = max(0, x_min - int(qr_width * 0.2))
-            crop_x_max = min(img_w, x_max + int(qr_width * 0.2))
-            
-            if crop_y_max > crop_y_min and crop_x_max > crop_x_min:
-                clg_zone = img[crop_y_min:crop_y_max, crop_x_min:crop_x_max]
-                
-                if clg_zone.size > 0:
-                    ocr_results = ocr_reader.readtext(clg_zone, detail=0)
-                    full_text = " ".join(ocr_results)
-                    logging.info(f"Текст из зоны над QR: {full_text}")
-                    
-                    match = re.search(r'(?:\d[\s-]*){12}', full_text)
-                    if match:
-                        clean_code = re.sub(r'\D', '', match.group(0))
-                        detected_clg = f"{clean_code[:3]} {clean_code[3:6]} {clean_code[6:9]} {clean_code[9:]}"
-        except Exception as e:
-            logging.error(f"Не удалось сделать точечную вырезку над QR (пропускаем): {e}")
-
-    # 3. Резервный сценарий: Если код все еще не найден — сканируем ВСЁ фото целиком
-    if not detected_clg:
-        try:
-            logging.info("Точечный поиск не дал результатов. Запуск OCR по всей площади...")
-            ocr_results = ocr_reader.readtext(img, detail=0)
-            full_text = " ".join(ocr_results)
-            
-            match = re.search(r'(?:\d[\s-]*){12}', full_text)
-            if match:
-                clean_code = re.sub(r'\D', '', match.group(0))
-                detected_clg = f"{clean_code[:3]} {clean_code[3:6]} {clean_code[6:9]} {clean_code[9:]}"
-        except Exception as e:
-            logging.error(f"Ошибка при общем OCR сканировании кадра: {e}")
-                
-    return detected_link, detected_clg
+async def get_clg_from_url(url: str) -> str:
+    """
+    Ультралегкий веб-запрос. 
+    Получает CLG-код напрямую с сайта Certilogo по ID из ссылки без OCR.
+    """
+    try:
+        # Извлекаем ID (например, 06GD7NKF17) из ссылки
+        match = re.search(r'/qr/([A-Za-z0-9]+)', url)
+        if not match:
+            return ""
+        
+        qr_id = match.group(1)
+        # Официальный адрес API верификации Certilogo
+        api_url = f"https://api.certilogo.com/v1/code/{qr_id}"
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(api_url, headers=headers, timeout=5) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    # Извлекаем чистый 12-значный код из ответа компании
+                    clg_raw = data.get("code", "")
+                    if clg_raw and len(clg_raw) == 12:
+                        return f"{clg_raw[:3]} {clg_raw[3:6]} {clg_raw[6:9]} {clg_raw[9:]}"
+    except Exception as e:
+        logging.error(f"Не удалось получить CLG по сети: {e}")
+    return ""
 
 
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "👋 Привет! Бот исправлен и работает стабильно.\n\n"
-        "Отправь мне фото бирки, я считаю данные."
+        "👋 Привет! Бот оптимизирован для ультра-быстрой работы на слабом сервере.\n\n"
+        "Отправь мне фото бирки, я мгновенно считаю QR и выдам CLG-код!"
     )
 
 
 @dp.message(F.photo)
 async def handle_photo(message: Message):
-    status_msg = await message.answer("📥 Принял фото. Сканирую коды...")
+    status_msg = await message.answer("📥 Обрабатываю фото...")
 
     try:
         photo = message.photo[-1]
@@ -170,22 +142,22 @@ async def handle_photo(message: Message):
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
         if img is None:
-            await status_msg.edit_text("❌ Ошибка чтения файла. Попробуйте загрузить фото еще раз.")
+            await status_msg.edit_text("❌ Ошибка чтения изображения.")
             return
 
         loop = asyncio.get_running_loop()
-        
-        # Безопасный вызов сканера
-        detected_link, detected_clg = await loop.run_in_executor(None, scan_tag_data, img)
+        detected_link = await loop.run_in_executor(None, decode_qr_from_photo, img)
 
-        # Обработка результатов
         if detected_link:
-            clg_text = detected_clg if detected_clg else "Не удалось распознать"
+            # Вместо тяжелого OCR делаем легкий запрос во внешней функции
+            detected_clg = await get_clg_from_url(detected_link)
+            
+            clg_text = detected_clg if detected_clg else "Не удалось запросить у Certilogo"
             
             await status_msg.edit_text(
                 f"🔢 **CLG-код:** {clg_text}\n"
                 f"🔗 **QR-код:** {detected_link}\n\n"
-                f"⏳ Создаю кастомный QR..."
+                f"⏳ Создаю макет..."
             )
             
             # Генерация нового QR на макете
@@ -199,23 +171,15 @@ async def handle_photo(message: Message):
             )
             await message.reply_document(document=document, caption=caption_text)
             await status_msg.delete()
-            
         else:
-            if detected_clg:
-                await status_msg.edit_text(
-                    f"✅ Текстовый код успешно считан!\n\n"
-                    f"🔢 **CLG-код:** {detected_clg}\n\n"
-                    f"⚠️ Ссылку из QR-кода распознать не удалось."
-                )
-            else:
-                await status_msg.edit_text(
-                    "❌ Не удалось считать данные.\n\n"
-                    "Убедитесь, что цифры и QR-код находятся в фокусе, не размыты и на них нет ярких бликов."
-                )
+            await status_msg.edit_text(
+                "❌ Не удалось считать QR-код.\n"
+                "Пожалуйста, сделайте фото ровнее, ближе и без бликов."
+            )
 
     except Exception as e:
-        logging.error(f"Критическая ошибка handle_photo: {e}")
-        await message.answer("💥 Произошла системная ошибка при обработке.")
+        logging.error(f"Ошибка обработки: {e}")
+        await message.answer("💥 Произошла ошибка при обработке.")
         if 'status_msg' in locals():
             try:
                 await status_msg.delete()
@@ -223,14 +187,9 @@ async def handle_photo(message: Message):
                 pass
 
 
-@dp.message()
-async def handle_other(message: Message):
-    await message.answer("Пожалуйста, отправь мне именно **фотографию бирки**.")
-
-
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("🚀 Бот перезапущен в безопасном режиме!")
+    logging.info("🚀 Легкий бот запущен!")
     await dp.start_polling(bot)
 
 
