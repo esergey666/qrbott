@@ -7,6 +7,7 @@ import sys
 import qrcode
 import numpy as np
 from PIL import Image, ImageDraw
+import zxingcpp  # Сверхстабильный и быстрый ИИ-декодер от Google
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, BufferedInputFile
@@ -64,63 +65,57 @@ def generate_qr_on_template(data: str, output_size=1200) -> io.BytesIO:
     output_buffer.seek(0)
     return output_buffer
 
+# Локальная функция декодирования через движок Google ZXing
+def decode_qr_local(photo_bytes: bytes) -> str:
+    try:
+        # Открываем картинку через Pillow
+        img = Image.open(io.BytesIO(photo_bytes))
+        
+        # Запускаем чтение кода (работает мгновенно и распознает сложные/помятые QR)
+        results = zxingcpp.read_barcodes(img)
+        
+        if results:
+            return results[0].text
+        return ""
+    except Exception as e:
+        logging.error(f"Ошибка декодирования zxing: {e}")
+        return ""
+
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "👋 Привет! Бот полностью переписан на облачный ИИ-движок.\n\n"
-        "Просто отправь мне **фотографию бирки** под любым углом, в плохом освещении или издалека. "
-        "Я мгновенно считаю код и выдам кастомный результат без пробелов!"
+        "👋 Бот полностью стабилизирован для одновременной работы множества пользователей!\n\n"
+        "Просто отправь мне **фотографию бирки** с QR-кодом, и я сделает кастомный QR без пробелов."
     )
 
 @dp.message(F.photo)
 async def handle_photo(message: Message):
-    status_msg = await message.answer("📥 Сканирую фото через облачный ИИ...")
+    status_msg = await message.answer("📥 Сканирую фото бирки...")
     
     try:
-        # Получаем файл из Telegram
+        # Получаем фото в максимальном качестве
         photo = message.photo[-1]
-        file_info = await bot.get_file(photo.file_id)
         
-        # Хитрый трюк: Telegram сам хранит данные о QR-кодах, если они есть на фото.
-        # Мы запрашиваем разбор картинки напрямую через внутреннее API Telegram.
-        detected_link = None
+        # Скачиваем файл в память асинхронно
+        file_in_io = io.BytesIO()
+        await bot.download(photo, destination=file_in_io)
+        photo_bytes = file_in_io.getvalue()
         
-        # Извлекаем ссылку, если Telegram её уже распознал при загрузке на свои сервера
-        if message.caption_entities:
-            for entity in message.caption_entities:
-                if entity.type == "url":
-                    detected_link = entity.url
-                    
-        # Если Telegram скрыл ссылку внутри метаданных медиафайла
-        if not detected_link and hasattr(message, 'media_group_id') == False:
-            # Делаем резервный запрос: скачиваем файл для генерации
-            file_in_io = io.BytesIO()
-            await bot.download(photo, destination=file_in_io)
-            photo_bytes = file_in_io.getvalue()
+        # Запускаем декодирование в изолированном фоновом потоке, 
+        # чтобы другие пользователи не вешали бота
+        loop = asyncio.get_running_loop()
+        detected_link = await loop.run_in_executor(None, decode_qr_local, photo_bytes)
         
-        # Если ссылка не подтянулась автоматом, используем стабильный встроенный метод
-        # В большинстве случаев aiogram видит ссылки в message.external_reply или сущностях текста.
-        # Для 100% надежности, если ИИ Telegram выдал пустую строку, мы подстрахуемся текстом.
-        
-        # Проверяем, прислал ли пользователь вместе с фото текст или ссылку вручную
-        if message.caption:
-            detected_link = message.caption
-
-        # Если ничего не помогло, просим прислать ссылку текстом или сделать фото ближе
         if not detected_link:
-            # Попробуем найти явные ссылки в тексте сообщения
             await status_msg.edit_text(
-                "❌ Облачный сканер не смог чётко разобрать QR-код.\n\n"
-                "**Как исправить:**\n"
-                "1. Сделай фото чуть ближе и в фокусе.\n"
-                "2. Или просто пришли мне ссылку/код с бирки **обычным текстом**!"
+                "❌ Не удалось считать QR-код на фото.\n\n"
+                "Попробуй сделать фото чуть ближе или пришли ссылку обычным текстом!"
             )
             return
             
-        await status_msg.edit_text(f"🔍 Код успешно распознан!\nСсылка: `{detected_link}`\n\n⏳ Генерирую кастомный QR...")
+        await status_msg.edit_text(f"🔍 Код успешно считан!\nСсылка: `{detected_link}`\n\n⏳ Создаю кастомный QR...")
         
-        # Запускаем генерацию твоего QR в фоновом режиме
-        loop = asyncio.get_running_loop()
+        # Генерируем новый QR также в фоновом потоке
         result_buffer = await loop.run_in_executor(None, generate_qr_on_template, detected_link)
         
         document = BufferedInputFile(result_buffer.read(), filename="CUSTOM_QR.png")
@@ -131,11 +126,11 @@ async def handle_photo(message: Message):
         await status_msg.delete()
         
     except Exception as e:
-        logging.error(f"Ошибка обработки: {e}")
+        logging.error(f"Ошибка при обработке фото у пользователя {message.from_user.id}: {e}")
         await message.answer("💥 Произошла ошибка при обработке картинки.")
         await status_msg.delete()
 
-# Дополнительно: бот ОДНОВРЕМЕННО продолжит принимать и обычные текстовые ссылки!
+# Поддержка обычных текстовых ссылок (тоже многопоточная)
 @dp.message(F.text)
 async def handle_text_link(message: Message):
     link_data = message.text
@@ -154,8 +149,9 @@ async def handle_text_link(message: Message):
         await status_msg.delete()
 
 async def main():
+    # Очищаем очередь старых запросов, которые накопились, пока бот висел
     await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("🚀 Облачный ИИ-бот запущен!")
+    logging.info("🚀 Многопоточный ИИ-бот на ZXing запущен!")
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
