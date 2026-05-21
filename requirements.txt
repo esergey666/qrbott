@@ -3,4 +3,4 @@ qrcode
 pillow
 python-dotenv
 opencv-contrib-python-headless
-pytesseract
+easyocr
