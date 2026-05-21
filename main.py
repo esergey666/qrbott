@@ -3,9 +3,7 @@ import logging
 import io
 import os
 import sys
-import re
 from io import BytesIO
-import aiohttp  # Легкие асинхронные запросы вместо тяжелого OCR
 
 # Базовые библиотеки
 import qrcode
@@ -13,12 +11,14 @@ from PIL import Image, ImageDraw
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+# Перехватываем ошибки импорта OpenCV, так как на хостинге он ставится долго
 try:
     import cv2
     import numpy as np
+
     logging.info("✅ Успешный импорт OpenCVcontrib")
-except ModuleNotFoundError as e:
-    logging.critical(f"💥 ОШИБКА: Не установлена библиотека! {e}. Проверьте requirements.txt")
+except ModuleNotFoundError:
+    logging.critical("💥 ОШИБКА: Библиотека 'opencv-contrib-python-headless' не установлена! Проверьте requirements.txt")
     sys.exit(1)
 
 from aiogram import Bot, Dispatcher, F
@@ -35,10 +35,8 @@ dp = Dispatcher()
 
 TEMPLATE_PATH = "maket.jpg"
 
-# ИНИЦИАЛИЗАЦИЯ ДВИЖКА QR (потребляет мало памяти)
-wechat_detector = cv2.wechat_qrcode_WeChatQRCode()
 
-
+# Твой алгоритм генерации QR-кода на макете
 def generate_qr_on_template(data: str, output_size=1200) -> io.BytesIO:
     if not os.path.exists(TEMPLATE_PATH):
         raise FileNotFoundError(f"Файл макета '{TEMPLATE_PATH}' не найден!")
@@ -79,58 +77,47 @@ def generate_qr_on_template(data: str, output_size=1200) -> io.BytesIO:
     return output_buffer
 
 
-def decode_qr_from_photo(img: np.ndarray) -> str:
-    try:
-        res, points = wechat_detector.detectAndDecode(img)
-        return res[0] if res else ""
-    except Exception as e:
-        logging.error(f"Ошибка WeChat: {e}")
-        return ""
+# ИНИЦИАЛИЗАЦИЯ ИИ-ДЕКОДЕРА WECHAT (делается один раз при запуске бота)
+# Это сверхмощная нейросеть, встроенная в OpenCVcontrib
+wechat_detector = cv2.wechat_qrcode_WeChatQRCode()
 
 
-async def get_clg_from_url(url: str) -> str:
-    """
-    Ультралегкий веб-запрос. 
-    Получает CLG-код напрямую с сайта Certilogo по ID из ссылки без OCR.
-    """
+# Функция декодирования через ИИ-движок WeChat
+def decode_qr_from_photo(photo_bytes: bytes) -> str:
     try:
-        # Извлекаем ID (например, 06GD7NKF17) из ссылки
-        match = re.search(r'/qr/([A-Za-z0-9]+)', url)
-        if not match:
+        # Превращаем байты в формат, понятный OpenCV
+        nparr = np.frombuffer(photo_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+        if img is None:
             return ""
-        
-        qr_id = match.group(1)
-        # Официальный адрес API верификации Certilogo
-        api_url = f"https://api.certilogo.com/v1/code/{qr_id}"
-        
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        }
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.get(api_url, headers=headers, timeout=5) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    # Извлекаем чистый 12-значный код из ответа компании
-                    clg_raw = data.get("code", "")
-                    if clg_raw and len(clg_raw) == 12:
-                        return f"{clg_raw[:3]} {clg_raw[3:6]} {clg_raw[6:9]} {clg_raw[9:]}"
+
+        # Находим и декодируем QR-код с помощью нейросети
+        # res — это список найденных строк (WeChat видит все коды в кадре)
+        res, points = wechat_detector.detectAndDecode(img)
+
+        # Если хотя бы один код найден, берем первый
+        if res:
+            return res[0]
+        else:
+            return ""
     except Exception as e:
-        logging.error(f"Не удалось получить CLG по сети: {e}")
-    return ""
+        logging.error(f"Ошибка внутри ИИ-декодера WeChat: {e}")
+        return ""
 
 
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "👋 Привет! Бот оптимизирован для ультра-быстрой работы на слабом сервере.\n\n"
-        "Отправь мне фото бирки, я мгновенно считаю QR и выдам CLG-код!"
+        "👋 Привет! Бот обновлен до уровня ИИ-сканера.\n\n"
+        "Я использую сверхмощный нейросетевой движок WeChat для распознавания QR-кодов. "
+        "Просто отправь мне фото бирки под любым углом и с любым освещением, я считаю код и сделаю кастомный QR!"
     )
 
 
 @dp.message(F.photo)
 async def handle_photo(message: Message):
-    status_msg = await message.answer("📥 Обрабатываю фото...")
+    status_msg = await message.answer("📥 Принял фото. Запускаю ИИ-сканер для поиска QR-кода...")
 
     try:
         photo = message.photo[-1]
@@ -138,58 +125,44 @@ async def handle_photo(message: Message):
         await bot.download(photo, destination=file_in_io)
         photo_bytes = file_in_io.getvalue()
 
-        nparr = np.frombuffer(photo_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        # Мощное ИИ-декодирование в фоновом потоке
+        loop = asyncio.get_running_loop()
+        detected_link = await loop.run_in_executor(None, decode_qr_from_photo, photo_bytes)
 
-        if img is None:
-            await status_msg.edit_text("❌ Ошибка чтения изображения.")
+        if not detected_link:
+            await status_msg.edit_text(
+                "❌ К сожалению, даже ИИ-сканер не смог найти QR-код на этом фото.\n\n"
+                "Это значит, что изображение слишком размыто, код полностью засвечен бликом от лампы или перекрыт грязью."
+            )
             return
 
-        loop = asyncio.get_running_loop()
-        detected_link = await loop.run_in_executor(None, decode_qr_from_photo, img)
+        await status_msg.edit_text(
+            f"🔍 ИИ-сканер успешно распознал код!\nСсылка: `{detected_link}`\n\n⏳ Создаю кастомный QR...")
 
-        if detected_link:
-            # Вместо тяжелого OCR делаем легкий запрос во внешней функции
-            detected_clg = await get_clg_from_url(detected_link)
-            
-            clg_text = detected_clg if detected_clg else "Не удалось запросить у Certilogo"
-            
-            await status_msg.edit_text(
-                f"🔢 **CLG-код:** {clg_text}\n"
-                f"🔗 **QR-код:** {detected_link}\n\n"
-                f"⏳ Создаю макет..."
-            )
-            
-            # Генерация нового QR на макете
-            result_buffer = await loop.run_in_executor(None, generate_qr_on_template, detected_link)
-            document = BufferedInputFile(result_buffer.read(), filename="CUSTOM_QR.png")
-            
-            caption_text = (
-                f"✅ Готово!\n\n"
-                f"🔢 CLG-код: {clg_text}\n"
-                f"🔗 Ссылка: {detected_link}"
-            )
-            await message.reply_document(document=document, caption=caption_text)
-            await status_msg.delete()
-        else:
-            await status_msg.edit_text(
-                "❌ Не удалось считать QR-код.\n"
-                "Пожалуйста, сделайте фото ровнее, ближе и без бликов."
-            )
+        # Генерация нового QR
+        result_buffer = await loop.run_in_executor(None, generate_qr_on_template, detected_link)
+
+        document = BufferedInputFile(result_buffer.read(), filename="CUSTOM_QR.png")
+        await message.reply_document(
+            document=document,
+            caption=f"✅ Готово!\nСсылка из бирки: `{detected_link}`"
+        )
+        await status_msg.delete()
 
     except Exception as e:
-        logging.error(f"Ошибка обработки: {e}")
-        await message.answer("💥 Произошла ошибка при обработке.")
-        if 'status_msg' in locals():
-            try:
-                await status_msg.delete()
-            except:
-                pass
+        logging.error(f"Ошибка при обработке фото: {e}")
+        await message.answer("💥 Произошла ошибка при обработке изображения на сервере.")
+        await status_msg.delete()
+
+
+@dp.message()
+async def handle_other(message: Message):
+    await message.answer("Пожалуйста, отправь мне именно **фотографию бирки**.")
 
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("🚀 Легкий бот запущен!")
+    logging.info("🚀 Сверхмощный ИИ-бот на WeChatQRCode запущен!")
     await dp.start_polling(bot)
 
 
