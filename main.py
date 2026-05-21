@@ -19,7 +19,7 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 # Имя файла макета, который лежит в одной папке с ботом
-TEMPLATE_PATH = "maket.png"
+TEMPLATE_PATH = "maket.jpg"
 
 
 # Алгоритм генерации QR-кода без пробелов на макете
