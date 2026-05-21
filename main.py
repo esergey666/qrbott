@@ -15,9 +15,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 try:
     import cv2
     import numpy as np
-    logging.info("✅ Успешный импорт OpenCV")
-except ModuleNotFoundError:
-    logging.critical("💥 ОШИБКА: Библиотека 'opencv-contrib-python-headless' не установлена!")
+    import pytesseract  
+    logging.info("✅ Успешный импорт OpenCV и PyTesseract")
+except ModuleNotFoundError as e:
+    logging.critical(f"💥 ОШИБКА: Проверьте зависимости! {e}")
     sys.exit(1)
 
 from aiogram import Bot, Dispatcher, F
@@ -30,59 +31,87 @@ dp = Dispatcher()
 
 TEMPLATE_PATH = "maket.jpg"
 
-# ИИ-декодер WeChat для QR-кодов
+# Включаем WeChat QR декодер
 wechat_detector = cv2.wechat_qrcode_WeChatQRCode()
 
 
-def convert_hash_to_clg(url: str) -> str:
+def crop_and_ocr_clg(img, points) -> str:
     """
-    Математический декодер Certilogo. 
-    Преобразует буквенно-цифровой хэш из короткой ссылки в оригинальные 12 цифр CLG.
+    Стабильно извлекает координаты QR-кода, аккуратно вырезает 
+    строку с CLG над ним и распознает цифры через Tesseract.
     """
     try:
-        # Если в ссылке уже есть 12 цифр подряд, просто форматируем их
-        match = re.search(r'\d{12}', url)
-        if match:
-            c = match.group(0)
-            return f"{c[:3]} {c[3:6]} {c[6:9]} {c[9:]}"
+        h, w, _ = img.shape
         
-        # Выделяем уникальный хэш-код из ссылки (например, 07CNX7P6OJ)
-        hash_match = re.search(r'/qr/([A-Z0-9]{10})', url, re.IGNORECASE)
-        if not hash_match:
-            # Попробуем найти любой 10-значный буквенно-цифровой хвост ссылки
-            hash_match = re.search(r'([A-Z0-9]{10})$', url.strip(), re.IGNORECASE)
-            
-        if hash_match:
-            code_str = hash_match.group(1).upper()
-            
-            # Алфавит, используемый Certilogo для кодирования (Base32/Base36 вариация)
-            alphabet = "0123456789ABCDEFGHJKLMNPQRSTUVWXYZ"
-            
-            # Переводим хэш-строку в уникальное числовое значение
-            val = 0
-            for char in code_str:
-                if char in alphabet:
-                    val = val * len(alphabet) + alphabet.index(char)
-                else:
-                    return "Ошибка символов в хэше"
-            
-            # Извлекаем 12-значный CLG код из полученного математического значения
-            clg_num = str(val % 1000000000000).zfill(12)
-            
-            # Если код получился некорректным, используем резервную формулу смещения
-            if clg_num.startswith("000"):
-                val_alt = val ^ 0x5F3759DF
-                clg_num = str(val_alt % 1000000000000).zfill(12)
+        # WeChat возвращает список массивов. Переводим в плоский массив точек int
+        pts = np.array(points[0]).reshape(4, 2).astype(int)
+        
+        # Находим крайние координаты QR-кода
+        min_x = np.min(pts[:, 0])
+        max_x = np.max(pts[:, 0])
+        min_y = np.min(pts[:, 1])
+        
+        qr_width = max_x - min_x
+        if qr_width <= 0:
+            qr_width = 200
 
-            return f"{clg_num[:3]} {clg_num[3:6]} {clg_num[6:9]} {clg_num[9:]}"
+        # Вычисляем зону строго над QR-кодом
+        # Поднимаемся вверх на 55% от ширины QR и берем ширину с запасом 20% вбок
+        crop_top = max(0, min_y - int(qr_width * 0.55))
+        crop_bottom = max(0, min_y - int(qr_width * 0.05)) # Чуть выше рамки QR
+        crop_left = max(0, min_x - int(qr_width * 0.2))
+        crop_right = min(w, max_x + int(qr_width * 0.2))
+        
+        # Проверка на корректность получившихся координат
+        if crop_bottom <= crop_top or crop_right <= crop_left:
+            return "Ошибка позиционирования кода"
             
-        return "Не удалось математически разобрать ссылку"
+        # Вырезаем область (Region of Interest)
+        roi = img[crop_top:crop_bottom, crop_left:crop_right]
+        
+        # --- ПРЕДОБРАБОТКА ИЗОБРАЖЕНИЯ ДЛЯ СТАБИЛЬНОГО OCR ---
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        
+        # Увеличиваем картинку в 3 раза (Tesseract любит крупные шрифты)
+        resized = cv2.resize(gray, (0, 0), fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+        
+        # Легкое размытие, чтобы сгладить текстуру ткани
+        blurred = cv2.GaussianBlur(resized, (5, 5), 0)
+        
+        # Адаптивный ЧБ фильтр: убирает перепады света и тени
+        thresh = cv2.adaptiveThreshold(
+            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+            cv2.THRESH_BINARY, 11, 2
+        )
+        
+        # Конфигурация Tesseract: psm 7 (поиск одной строки текста)
+        custom_config = r'--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789'
+        text = pytesseract.image_to_string(thresh, config=custom_config)
+        
+        # Очищаем результат от пробелов и мусора
+        cleaned = re.sub(r'\s+', '', text)
+        
+        # Поиск 12 цифр подряд
+        match = re.search(r'\d{12}', cleaned)
+        if match:
+            code = match.group(0)
+            return f"{code[:3]} {code[3:6]} {code[6:9]} {code[9:]}"
+            
+        # Резервный вариант: если цифры разбились пробелами, собираем всё что нашли
+        digits_only = ''.join(filter(str.isdigit, cleaned))
+        if len(digits_only) == 12:
+            return f"{digits_only[:3]} {digits_only[3:6]} {digits_only[6:9]} {digits_only[9:]}"
+        elif len(digits_only) >= 10:
+            return f"Частично: {digits_only}"
+            
+        return "Не удалось считать цифры над QR"
+        
     except Exception as e:
-        logging.error(f"Ошибка декодирования хэша: {e}")
-        return "Ошибка обработки алгоритма CLG"
+        logging.error(f"Ошибка в блоке кропа/OCR: {e}")
+        return "Ошибка обработки текста"
 
 
-# Твой рабочий алгоритм генерации QR (без изменений)
+# Алгоритм генерации QR (без изменений)
 def generate_qr_on_template(data: str, output_size=1200) -> io.BytesIO:
     if not os.path.exists(TEMPLATE_PATH):
         raise FileNotFoundError(f"Файл макета '{TEMPLATE_PATH}' не найден!")
@@ -108,8 +137,7 @@ def generate_qr_on_template(data: str, output_size=1200) -> io.BytesIO:
 
 @dp.message(F.photo)
 async def handle_photo(message: Message):
-    # Отправляем сообщение-статус, чтобы пользователь видел работу бота
-    status_msg = await message.answer("📥 ИИ-сканер считывает QR-код бирки...")
+    status_msg = await message.answer("📥 Обрабатываю изображение бирки...")
 
     try:
         photo = message.photo[-1]
@@ -121,27 +149,46 @@ async def handle_photo(message: Message):
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
         if img is None:
-            await status_msg.edit_text("❌ Не удалось прочитать изображение.")
+            await status_msg.edit_text("❌ Ошибка чтения файла изображения.")
             return
 
-        # Сканируем QR-код через WeChat (работает стабильно)
+        # Находим QR-код
         res, points = wechat_detector.detectAndDecode(img)
 
-        if not res or len(res) == 0:
-            await status_msg.edit_text("❌ QR-код на фотографии не обнаружен. Сделайте фото четче.")
+        if not res or points is None or len(points) == 0:
+            await status_msg.edit_text("❌ QR-код не обнаружен. Сделайте фото ровнее.")
             return
 
         detected_link = res[0]
-        
-        # Извлекаем 12 цифр CLG с помощью автономного математического алгоритма
-        clg_code = convert_hash_to_clg(detected_link)
 
-        # Перевыпускаем кастомный QR по твоему шаблону
+        # Безопасный запуск OCR в фоновом потоке, чтобы бот не зависал
         loop = asyncio.get_running_loop()
+        clg_code = await loop.run_in_executor(None, crop_and_ocr_clg, img, points)
+
+        # Генерируем кастомный QR
         result_buffer = await loop.run_in_executor(None, generate_qr_on_template, detected_link)
         document = BufferedInputFile(result_buffer.read(), filename="CUSTOM_QR.png")
         
-        # Отправляем результат в чат
         await message.reply_document(
             document=document,
-            caption=
+            caption=f"✅ **Обработка завершена!**\n\n"
+                    f"🔢 **Код CLG:** `{clg_code}`\n"
+                    f"🔗 **Ссылка:** `{detected_link}`"
+        )
+        await status_msg.delete()
+
+    except Exception as e:
+        logging.error(f"Глобальная ошибка обработчика: {e}")
+        await message.answer("💥 Произошла ошибка при анализе изображения.")
+        try:
+            await status_msg.delete()
+        except:
+            pass
+
+
+async def main():
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+if __name__ == '__main__':
+    asyncio.run(main())
