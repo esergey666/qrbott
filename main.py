@@ -6,10 +6,7 @@ import sys
 
 import qrcode
 from PIL import Image, ImageDraw
-import zxingcpp  # Сверхстабильный декодер от Google
-
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, BufferedInputFile
+from qreader import QReader  # Мощный ИИ-декодер на чистом Python
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -23,8 +20,10 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 TEMPLATE_PATH = "maket.jpg"
+# Инициализируем ИИ-читалку кодов
+qreader = QReader()
 
-# Твой алгоритм генерации QR-кода на макете (ТЕПЕРЬ БЕЗ NUMPY)
+# Твой алгоритм генерации QR-кода на макете
 def generate_qr_on_template(data: str, output_size=1200) -> io.BytesIO:
     if not os.path.exists(TEMPLATE_PATH):
         raise FileNotFoundError(f"Файл макета '{TEMPLATE_PATH}' не найден!")
@@ -41,9 +40,8 @@ def generate_qr_on_template(data: str, output_size=1200) -> io.BytesIO:
     qr.add_data(data)
     qr.make(fit=True)
     
-    # Получаем матрицу QR-кода в виде обычного списка списков Python (вместо numpy)
     qr_matrix = qr.get_matrix()
-    matrix_size = len(qr_matrix)  # Для version=3 это будет 29
+    matrix_size = len(qr_matrix)
     
     module_size = template.width // matrix_size
     qr_layer = Image.new('RGBA', (matrix_size * module_size, matrix_size * module_size), (0, 0, 0, 0))
@@ -51,7 +49,7 @@ def generate_qr_on_template(data: str, output_size=1200) -> io.BytesIO:
     
     for y in range(matrix_size):
         for x in range(matrix_size):
-            if qr_matrix[y][x]:  # Если модуль черный (True)
+            if qr_matrix[y][x]:
                 left = x * module_size
                 top = y * module_size
                 right = left + module_size
@@ -67,28 +65,32 @@ def generate_qr_on_template(data: str, output_size=1200) -> io.BytesIO:
     output_buffer.seek(0)
     return output_buffer
 
-# Декодирование через движок Google ZXing
+# Декодирование через qreader
 def decode_qr_local(photo_bytes: bytes) -> str:
     try:
-        img = Image.open(io.BytesIO(photo_bytes))
-        results = zxingcpp.read_barcodes(img)
-        if results:
-            return results[0].text
+        # Открываем изображение через Pillow
+        img = Image.open(io.BytesIO(photo_bytes)).convert('RGB')
+        
+        # qreader ищет QR-коды на лету
+        decoded_text = qreader.detect_and_decode(image=img)
+        
+        if decoded_text and decoded_text[0]:
+            return decoded_text[0]
         return ""
     except Exception as e:
-        logging.error(f"Ошибка декодирования zxing: {e}")
+        logging.error(f"Ошибка декодирования QReader: {e}")
         return ""
 
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "👋 Бот обновлен и полностью защищен от зависаний!\n\n"
-        "Отправь мне **фотографию бирки** с QR-кодом, и я сделаю кастомный QR без пробелов."
+        "👋 Бот готов к работе в многопоточном ИИ-режиме!\n\n"
+        "Отправь мне **фотографию бирки** с QR-кодом (даже сложную или помятую), и я сделаю кастомный QR без пробелов."
     )
 
 @dp.message(F.photo)
 async def handle_photo(message: Message):
-    status_msg = await message.answer("📥 Сканирую фото бирки...")
+    status_msg = await message.answer("📥 Сканирую фото бирки ИИ-радарчиком...")
     
     try:
         photo = message.photo[-1]
@@ -96,14 +98,14 @@ async def handle_photo(message: Message):
         await bot.download(photo, destination=file_in_io)
         photo_bytes = file_in_io.getvalue()
         
-        # Обработка в изолированном потоке для многопоточности
+        # Выполняем в фоновом потоке, чтобы бот не зависал при наплыве юзеров
         loop = asyncio.get_running_loop()
         detected_link = await loop.run_in_executor(None, decode_qr_local, photo_bytes)
         
         if not detected_link:
             await status_msg.edit_text(
                 "❌ Не удалось считать QR-код на фото.\n\n"
-                "Попробуй сделать фото ближе или пришли ссылку обычным текстом!"
+                "Попробуй сделать фото чуть ближе или пришли ссылку обычным текстом!"
             )
             return
             
@@ -142,7 +144,7 @@ async def handle_text_link(message: Message):
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("🚀 Бот без numpy успешно запущен!")
+    logging.info("🚀 Финальный ИИ-бот успешно запущен!")
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
