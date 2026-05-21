@@ -9,17 +9,16 @@ from io import BytesIO
 # Базовые библиотеки
 import qrcode
 from PIL import Image, ImageDraw
-import aiohttp  # Для быстрых запросов к Certilogo
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Перехватываем стандартный OpenCV (обычный opencv-python, без contrib)
 try:
     import cv2
     import numpy as np
-    logging.info("✅ Успешный импорт OpenCV")
-except ModuleNotFoundError:
-    logging.critical("💥 ОШИБКА: Библиотека 'opencv-python' не установлена!")
+    import pytesseract  # Снова используем его, но теперь точечно!
+    logging.info("✅ Успешный импорт OpenCV и PyTesseract")
+except ModuleNotFoundError as e:
+    logging.critical(f"💥 ОШИБКА: Проверьте зависимости! {e}")
     sys.exit(1)
 
 from aiogram import Bot, Dispatcher, F
@@ -27,135 +26,100 @@ from aiogram.types import Message, BufferedInputFile
 
 TOKEN = os.getenv("API_TOKEN") or os.getenv("BOT_TOKEN")
 
-if not TOKEN:
-    logging.critical("❌ Токен не найден в переменных окружения!")
-    sys.exit(1)
-
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 TEMPLATE_PATH = "maket.jpg"
 
-# Инициализируем стандартный детектор QR (WeChat нам больше не нужен, обычный тоже справится, 
-# либо оставь свой старый движок wechat_detector, если он тебе больше нравился)
-qr_detector = cv2.QRCodeDetector()
+# Включаем WeChat QR декодер (он даёт координаты углов)
+wechat_detector = cv2.wechat_qrcode_WeChatQRCode()
 
 
-# --- НАДЁЖНЫЙ КАНАЛ ПОЛУЧЕНИЯ CLG КОДА ЧЕРЕЗ API ---
-async def get_clg_from_certilogo(url: str) -> str:
+def crop_and_ocr_clg(img, points) -> str:
     """
-    Делает запрос к Certilogo и забирает оригинальный 12-значный код, 
-    который сервер выдает при редиректе.
+    Берет координаты QR-кода, вычисляет зону НАД ним 
+    и отправляет в Tesseract только чистые цифры.
     """
-    # Если в ссылке уже есть 12 цифр подряд, просто забираем их
-    match = re.search(r'\d{12}', url)
-    if match:
-        code = match.group(0)
-        return f"{code[:3]} {code[3:6]} {code[6:9]} {code[9:]}"
-        
-    # Если ссылка короткая (буквенная), спрашиваем у официального сервера
-    headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
-    }
     try:
-        async with aiohttp.ClientSession(headers=headers) as session:
-            # Отправляем запрос и смотрим, куда нас перенаправит сайт
-            async with session.get(url, allow_redirects=True, timeout=5) as response:
-                final_url = str(response.url)
-                
-                # Ищем 12 цифр в итоговой ссылке после редиректа
-                clg_match = re.search(r'\d{12}', final_url)
-                if clg_match:
-                    code = clg_match.group(0)
-                    return f"{code[:3]} {code[3:6]} {code[6:9]} {code[9:]}"
-                
-                # Попробуем прочесть текст страницы, если код скрыт в куках/сессии
-                html_text = await response.text()
-                code_in_html = re.search(r'CLG\s*(\d{3})\s*(\d{3})\s*(\d{3})\s*(\d{3})', html_text, re.IGNORECASE)
-                if code_in_html:
-                    return f"{code_in_html.group(1)} {code_in_html.group(2)} {code_in_html.group(3)} {code_in_html.group(4)}"
-                
-                # Альтернативный поиск 12 цифр в теле ответа
-                all_numbers = re.findall(r'\b\d{12}\b', html_text)
-                if all_numbers:
-                    code = all_numbers[0]
-                    return f"{code[:3]} {code[3:6]} {code[6:9]} {code[9:]}"
-
+        h, w, _ = img.shape
+        
+        # Получаем координаты углов QR-кода
+        pts = points[0].astype(int) # [[x0,y0], [x1,y1], [x2,y2], [x3,y3]]
+        
+        # Находим верхнюю границу QR-кода
+        top_y = min(pts[0][1], pts[1][1])
+        left_x = min(pts[0][0], pts[3][0])
+        right_x = max(pts[1][0], pts[2][0])
+        
+        qr_width = right_x - left_x
+        
+        # Вырезаем прямоугольник НАД QR-кодом (примерно на 40% от высоты QR-кода вверх)
+        # Немного расширяем влево и вправо, чтобы захватить буквы "CLG" и все цифры
+        crop_top = max(0, top_y - int(qr_width * 0.45))
+        crop_bottom = top_y - int(qr_width * 0.05) # Чуть выше самого QR, чтобы не поймать его рамку
+        crop_left = max(0, left_x - int(qr_width * 0.1))
+        crop_right = min(w, right_x + int(qr_width * 0.1))
+        
+        # Сама обрезка
+        roi = img[crop_top:crop_bottom, crop_left:crop_right]
+        
+        # Предварительная обработка вырезанного куска для улучшения читаемости
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        # Увеличиваем картинку в 2 раза, чтобы мелкий шрифт стал крупным
+        resized = cv2.resize(gray, (0, 0), fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+        # Делаем текст жестким черным, а фон белым
+        _, thresh = cv2.threshold(resized, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+        
+        # Настройки Tesseract: ищем строго строчку цифр
+        custom_config = r'--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789'
+        text = pytesseract.image_to_string(thresh, config=custom_config)
+        
+        cleaned = re.sub(r'\s+', '', text)
+        match = re.search(r'\d{12}', cleaned)
+        
+        if match:
+            code = match.group(0)
+            return f"{code[:3]} {code[3:6]} {code[6:9]} {code[9:]}"
+            
+        # Если 12 цифр не нашлось, попробуем взять вообще любые цифры (вдруг смазалась одна цифра)
+        just_digits = ''.join(filter(str.isdigit, cleaned))
+        if len(just_digits) >= 10:
+            return f"Приблизительно: {just_digits}"
+            
+        return "Не удалось считать текст над QR"
+        
     except Exception as e:
-        logging.error(f"Ошибка при запросе к Certilogo API: {e}")
-    
-    return "Не удалось извлечь код (запросите вручную)"
+        logging.error(f"Ошибка при кропе/OCR: {e}")
+        return "Ошибка зоны распознавания"
 
 
-# Твой рабочий алгоритм генерации QR-кода на макете (без изменений)
+# Твой алгоритм генерации QR (без изменений)
 def generate_qr_on_template(data: str, output_size=1200) -> io.BytesIO:
     if not os.path.exists(TEMPLATE_PATH):
         raise FileNotFoundError(f"Файл макета '{TEMPLATE_PATH}' не найден!")
-
     template = Image.open(TEMPLATE_PATH).convert('RGBA')
-
-    qr = qrcode.QRCode(
-        version=3,
-        error_correction=qrcode.constants.ERROR_CORRECT_L,
-        box_size=1,
-        border=0,
-        mask_pattern=3
-    )
+    qr = qrcode.QRCode(version=3, error_correction=qrcode.constants.ERROR_CORRECT_L, box_size=1, border=0, mask_pattern=3)
     qr.add_data(data)
     qr.make(fit=True)
     qr_matrix = np.array(qr.get_matrix(), dtype=np.uint8)
-
     module_size = template.width // 29
     qr_layer = Image.new('RGBA', (29 * module_size, 29 * module_size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(qr_layer)
-
     for y in range(29):
         for x in range(29):
             if qr_matrix[y, x] == 1:
-                left = x * module_size
-                top = y * module_size
-                right = left + module_size
-                bottom = top + module_size
-                draw.rectangle([left, top, right, bottom], fill=(0, 0, 0, 255))
-
+                draw.rectangle([x * module_size, y * module_size, (x + 1) * module_size, (y + 1) * module_size], fill=(0, 0, 0, 255))
     template_resized = template.resize(qr_layer.size, Image.Resampling.LANCZOS)
-    final = Image.alpha_composite(template_resized, qr_layer)
-    final = final.resize((output_size, output_size), Image.Resampling.LANCZOS)
-
+    final = Image.alpha_composite(template_resized, qr_layer).resize((output_size, output_size), Image.Resampling.LANCZOS)
     output_buffer = io.BytesIO()
     final.save(output_buffer, format="PNG", dpi=(300, 300))
     output_buffer.seek(0)
     return output_buffer
 
 
-def decode_qr_from_photo(photo_bytes: bytes) -> str:
-    try:
-        nparr = np.frombuffer(photo_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        if img is None:
-            return ""
-        
-        # Используем стандартный или твой старый WeChat декодер
-        # Если хочешь вернуть старый WeChat, замени две строки ниже на свой старый код WeChat
-        res, _, _ = qr_detector.detectAndDecode(img)
-        return res if res else ""
-    except Exception as e:
-        logging.error(f"Ошибка декодера QR: {e}")
-        return ""
-
-
-@dp.message(F.text == "/start")
-async def cmd_start(message: Message):
-    await message.answer(
-        "👋 Привет! Бот полностью перенастроен.\n\n"
-        "Теперь я считываю QR-код, автоматически запрашиваю официальную базу данных Certilogo "
-        "и присылаю тебе точный 12-значный CLG-код бирки вместе с кастомным QR!"
-    )
-
-
 @dp.message(F.photo)
 async def handle_photo(message: Message):
-    status_msg = await message.answer("📥 Фото получено. Считываю QR и запрашиваю код CLG...")
+    status_msg = await message.answer("📥 Обрабатываю изображение бирки...")
 
     try:
         photo = message.photo[-1]
@@ -163,47 +127,48 @@ async def handle_photo(message: Message):
         await bot.download(photo, destination=file_in_io)
         photo_bytes = file_in_io.getvalue()
 
-        loop = asyncio.get_running_loop()
-        
-        # 1. Сканируем QR-код
-        detected_link = await loop.run_in_executor(None, decode_qr_from_photo, photo_bytes)
+        # Декодируем картинку в массив OpenCV
+        nparr = np.frombuffer(photo_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-        if not detected_link:
-            await status_msg.edit_text("❌ QR-код не найден на фото. Попробуйте сделать снимок четче.")
+        if img is None:
+            await status_msg.edit_text("❌ Ошибка чтения файла изображения.")
             return
 
-        # 2. Магия: отправляем ссылку серверу Certilogo, чтобы он отдал нам 12 цифр
-        clg_code = await get_clg_from_certilogo(detected_link)
+        # Находим QR-код и получаем его точки (points)
+        res, points = wechat_detector.detectAndDecode(img)
 
-        # 3. Генерируем кастомный макет
+        if not res or points is None or len(points) == 0:
+            await status_msg.edit_text("❌ QR-код не обнаружен. Сделайте фото ровнее.")
+            return
+
+        detected_link = res[0]
+
+        # Запускаем чтение цифр СТРОГО в зоне над найденным кодом
+        loop = asyncio.get_running_loop()
+        clg_code = await loop.run_in_executor(None, crop_and_ocr_clg, img, points)
+
+        # Генерируем кастомный QR
         result_buffer = await loop.run_in_executor(None, generate_qr_on_template, detected_link)
         document = BufferedInputFile(result_buffer.read(), filename="CUSTOM_QR.png")
         
-        # Отправляем результат
         await message.reply_document(
             document=document,
-            caption=f"✅ **Данные успешно получены!**\n\n"
+            caption=f"✅ **Обработка завершена!**\n\n"
                     f"🔢 **Код CLG:** `{clg_code}`\n"
-                    f"🔗 **Ссылка из QR:** `{detected_link}`"
+                    f"🔗 **Ссылка:** `{detected_link}`"
         )
         await status_msg.delete()
 
     except Exception as e:
-        logging.error(f"Ошибка при обработке фото: {e}")
-        await message.answer("💥 Произошла ошибка при обработке изображения.")
+        logging.error(f"Ошибка: {e}")
+        await message.answer("💥 Произошла ошибка при анализе изображения.")
         await status_msg.delete()
-
-
-@dp.message()
-async def handle_other(message: Message):
-    await message.answer("Пожалуйста, отправь мне именно **фотографию бирки**.")
 
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("🚀 API-бот Certilogo запущен!")
     await dp.start_polling(bot)
-
 
 if __name__ == '__main__':
     asyncio.run(main())
