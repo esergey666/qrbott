@@ -2,3 +2,4 @@ aiogram
 qrcode
 pillow
 numpy
+python-dotenv
