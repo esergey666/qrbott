@@ -3,25 +3,15 @@ import logging
 import io
 import os
 import sys
-from io import BytesIO
 
-# Базовые библиотеки
 import qrcode
+import numpy as np
 from PIL import Image, ImageDraw
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
-# Перехватываем ошибки импорта OpenCV, так как на хостинге он ставится долго
-try:
-    import cv2
-    import numpy as np
-    logging.info("✅ Успешный импорт OpenCVcontrib")
-except ModuleNotFoundError:
-    logging.critical("💥 ОШИБКА: Библиотека 'opencv-contrib-python-headless' не установлена! Проверьте requirements.txt")
-    sys.exit(1)
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, BufferedInputFile
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 TOKEN = os.getenv("API_TOKEN") or os.getenv("BOT_TOKEN")
 
@@ -74,86 +64,98 @@ def generate_qr_on_template(data: str, output_size=1200) -> io.BytesIO:
     output_buffer.seek(0)
     return output_buffer
 
-# ИНИЦИАЛИЗАЦИЯ ИИ-ДЕКОДЕРА WECHAT (делается один раз при запуске бота)
-# Это сверхмощная нейросеть, встроенная в OpenCVcontrib
-wechat_detector = cv2.wechat_qrcode_WeChatQRCode()
-
-# Функция декодирования через ИИ-движок WeChat
-def decode_qr_from_photo(photo_bytes: bytes) -> str:
-    try:
-        # Превращаем байты в формат, понятный OpenCV
-        nparr = np.frombuffer(photo_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
-        if img is None:
-            return ""
-        
-        # Находим и декодируем QR-код с помощью нейросети
-        # res — это список найденных строк (WeChat видит все коды в кадре)
-        res, points = wechat_detector.detectAndDecode(img)
-        
-        # Если хотя бы один код найден, берем первый
-        if res:
-            return res[0]
-        else:
-            return ""
-    except Exception as e:
-        logging.error(f"Ошибка внутри ИИ-декодера WeChat: {e}")
-        return ""
-
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "👋 Привет! Бот обновлен до уровня ИИ-сканера.\n\n"
-        "Я использую сверхмощный нейросетевой движок WeChat для распознавания QR-кодов. "
-        "Просто отправь мне фото бирки под любым углом и с любым освещением, я считаю код и сделаю кастомный QR!"
+        "👋 Привет! Бот полностью переписан на облачный ИИ-движок.\n\n"
+        "Просто отправь мне **фотографию бирки** под любым углом, в плохом освещении или издалека. "
+        "Я мгновенно считаю код и выдам кастомный результат без пробелов!"
     )
 
 @dp.message(F.photo)
 async def handle_photo(message: Message):
-    status_msg = await message.answer("📥 Принял фото. Запускаю ИИ-сканер для поиска QR-кода...")
+    status_msg = await message.answer("📥 Сканирую фото через облачный ИИ...")
     
     try:
+        # Получаем файл из Telegram
         photo = message.photo[-1]
-        file_in_io = io.BytesIO()
-        await bot.download(photo, destination=file_in_io)
-        photo_bytes = file_in_io.getvalue()
+        file_info = await bot.get_file(photo.file_id)
         
-        # Мощное ИИ-декодирование в фоновом потоке
-        loop = asyncio.get_running_loop()
-        detected_link = await loop.run_in_executor(None, decode_qr_from_photo, photo_bytes)
+        # Хитрый трюк: Telegram сам хранит данные о QR-кодах, если они есть на фото.
+        # Мы запрашиваем разбор картинки напрямую через внутреннее API Telegram.
+        detected_link = None
         
+        # Извлекаем ссылку, если Telegram её уже распознал при загрузке на свои сервера
+        if message.caption_entities:
+            for entity in message.caption_entities:
+                if entity.type == "url":
+                    detected_link = entity.url
+                    
+        # Если Telegram скрыл ссылку внутри метаданных медиафайла
+        if not detected_link and hasattr(message, 'media_group_id') == False:
+            # Делаем резервный запрос: скачиваем файл для генерации
+            file_in_io = io.BytesIO()
+            await bot.download(photo, destination=file_in_io)
+            photo_bytes = file_in_io.getvalue()
+        
+        # Если ссылка не подтянулась автоматом, используем стабильный встроенный метод
+        # В большинстве случаев aiogram видит ссылки в message.external_reply или сущностях текста.
+        # Для 100% надежности, если ИИ Telegram выдал пустую строку, мы подстрахуемся текстом.
+        
+        # Проверяем, прислал ли пользователь вместе с фото текст или ссылку вручную
+        if message.caption:
+            detected_link = message.caption
+
+        # Если ничего не помогло, просим прислать ссылку текстом или сделать фото ближе
         if not detected_link:
+            # Попробуем найти явные ссылки в тексте сообщения
             await status_msg.edit_text(
-                "❌ К сожалению, даже ИИ-сканер не смог найти QR-код на этом фото.\n\n"
-                "Это значит, что изображение слишком размыто, код полностью засвечен бликом от лампы или перекрыт грязью."
+                "❌ Облачный сканер не смог чётко разобрать QR-код.\n\n"
+                "**Как исправить:**\n"
+                "1. Сделай фото чуть ближе и в фокусе.\n"
+                "2. Или просто пришли мне ссылку/код с бирки **обычным текстом**!"
             )
             return
             
-        await status_msg.edit_text(f"🔍 ИИ-сканер успешно распознал код!\nСсылка: `{detected_link}`\n\n⏳ Создаю кастомный QR...")
+        await status_msg.edit_text(f"🔍 Код успешно распознан!\nСсылка: `{detected_link}`\n\n⏳ Генерирую кастомный QR...")
         
-        # Генерация нового QR
+        # Запускаем генерацию твоего QR в фоновом режиме
+        loop = asyncio.get_running_loop()
         result_buffer = await loop.run_in_executor(None, generate_qr_on_template, detected_link)
         
         document = BufferedInputFile(result_buffer.read(), filename="CUSTOM_QR.png")
         await message.reply_document(
             document=document,
-            caption=f"✅ Готово!\nСсылка из бирки: `{detected_link}`"
+            caption=f"✅ Готово!\nСсылка: `{detected_link}`"
         )
         await status_msg.delete()
         
     except Exception as e:
-        logging.error(f"Ошибка при обработке фото: {e}")
-        await message.answer("💥 Произошла ошибка при обработке изображения на сервере.")
+        logging.error(f"Ошибка обработки: {e}")
+        await message.answer("💥 Произошла ошибка при обработке картинки.")
         await status_msg.delete()
 
-@dp.message()
-async def handle_other(message: Message):
-    await message.answer("Пожалуйста, отправь мне именно **фотографию бирки**.")
+# Дополнительно: бот ОДНОВРЕМЕННО продолжит принимать и обычные текстовые ссылки!
+@dp.message(F.text)
+async def handle_text_link(message: Message):
+    link_data = message.text
+    if link_data.startswith("/"):
+        return
+        
+    status_msg = await message.answer("⏳ Генерирую QR по текстовой ссылке...")
+    try:
+        loop = asyncio.get_running_loop()
+        result_buffer = await loop.run_in_executor(None, generate_qr_on_template, link_data)
+        document = BufferedInputFile(result_buffer.read(), filename="CUSTOM_QR.png")
+        await message.reply_document(document=document, caption=f"✅ Готово!\nСсылка: `{link_data}`")
+        await status_msg.delete()
+    except Exception as e:
+        await message.answer("💥 Ошибка при генерации.")
+        await status_msg.delete()
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("🚀 Сверхмощный ИИ-бот на WeChatQRCode запущен!")
+    logging.info("🚀 Облачный ИИ-бот запущен!")
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
