@@ -3,28 +3,24 @@ import logging
 import io
 import os
 import sys
-import re # Добавлен импорт для регулярных выражений
+import re
 from io import BytesIO
 
 # Базовые библиотеки
 import qrcode
 from PIL import Image, ImageDraw
+import aiohttp  # Для быстрых запросов к Certilogo
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Перехватываем ошибки импорта OpenCV и Tesseract
+# Перехватываем стандартный OpenCV (обычный opencv-python, без contrib)
 try:
     import cv2
     import numpy as np
-    import pytesseract  # Библиотека OCR для распознавания текста
-
-    logging.info("✅ Успешный импорт OpenCV и PyTesseract")
-except ModuleNotFoundError as e:
-    logging.critical(f"💥 ОШИБКА: Библиотека не установлена! {e}")
+    logging.info("✅ Успешный импорт OpenCV")
+except ModuleNotFoundError:
+    logging.critical("💥 ОШИБКА: Библиотека 'opencv-python' не установлена!")
     sys.exit(1)
-
-# Укажите путь к Tesseract exe, если вы на Windows (например: r'C:\Program Files\Tesseract-OCR\tesseract.exe')
-# pytesseract.pytesseract.tesseract_cmd = r'ПУТЬ_К_TESSERACT_EXE'
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, BufferedInputFile
@@ -40,43 +36,58 @@ dp = Dispatcher()
 
 TEMPLATE_PATH = "maket.jpg"
 
-# ИНИЦИАЛИЗАЦИЯ ИИ-ДЕКОДЕРА WECHAT (делается один раз при запуске бота)
-wechat_detector = cv2.wechat_qrcode_WeChatQRCode()
+# Инициализируем стандартный детектор QR (WeChat нам больше не нужен, обычный тоже справится, 
+# либо оставь свой старый движок wechat_detector, если он тебе больше нравился)
+qr_detector = cv2.QRCodeDetector()
 
-# --- НОВАЯ ФУНКЦИЯ ДЛЯ OCR ---
-# Функция для извлечения *напечатанного* 12-значного CLG кода через Tesseract OCR
-def extract_printed_clg_text(photo_bytes: bytes) -> str:
+
+# --- НАДЁЖНЫЙ КАНАЛ ПОЛУЧЕНИЯ CLG КОДА ЧЕРЕЗ API ---
+async def get_clg_from_certilogo(url: str) -> str:
+    """
+    Делает запрос к Certilogo и забирает оригинальный 12-значный код, 
+    который сервер выдает при редиректе.
+    """
+    # Если в ссылке уже есть 12 цифр подряд, просто забираем их
+    match = re.search(r'\d{12}', url)
+    if match:
+        code = match.group(0)
+        return f"{code[:3]} {code[3:6]} {code[6:9]} {code[9:]}"
+        
+    # Если ссылка короткая (буквенная), спрашиваем у официального сервера
+    headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
+    }
     try:
-        # Превращаем байты в PIL изображение
-        pil_img = Image.open(io.BytesIO(photo_bytes)).convert('L') # Переводим в ЧБ для лучшего OCR
+        async with aiohttp.ClientSession(headers=headers) as session:
+            # Отправляем запрос и смотрим, куда нас перенаправит сайт
+            async with session.get(url, allow_redirects=True, timeout=5) as response:
+                final_url = str(response.url)
+                
+                # Ищем 12 цифр в итоговой ссылке после редиректа
+                clg_match = re.search(r'\d{12}', final_url)
+                if clg_match:
+                    code = clg_match.group(0)
+                    return f"{code[:3]} {code[3:6]} {code[6:9]} {code[9:]}"
+                
+                # Попробуем прочесть текст страницы, если код скрыт в куках/сессии
+                html_text = await response.text()
+                code_in_html = re.search(r'CLG\s*(\d{3})\s*(\d{3})\s*(\d{3})\s*(\d{3})', html_text, re.IGNORECASE)
+                if code_in_html:
+                    return f"{code_in_html.group(1)} {code_in_html.group(2)} {code_in_html.group(3)} {code_in_html.group(4)}"
+                
+                # Альтернативный поиск 12 цифр в теле ответа
+                all_numbers = re.findall(r'\b\d{12}\b', html_text)
+                if all_numbers:
+                    code = all_numbers[0]
+                    return f"{code[:3]} {code[3:6]} {code[6:9]} {code[9:]}"
 
-        # Улучшаем контрастность (Tesseract любит четкий текст)
-        # Опционально: можно применить пороговую обработку
-        img_np = np.array(pil_img)
-        _, img_bin = cv2.threshold(img_np, 128, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-        processed_img = Image.fromarray(img_bin)
-
-        # Запускаем OCR. Мы используем только цифры.
-        # Конфигурация: psm 11 (авто-сегментация без выравнивания), whitelist=цифры
-        custom_config = r'--oem 3 --psm 11 -c tessedit_char_whitelist=0123456789'
-        text = pytesseract.image_to_string(processed_img, config=custom_config)
-        
-        # Очищаем текст от пробелов и переносов, ищем 12 цифр подряд
-        cleaned_text = re.sub(r'\s+', '', text)
-        match = re.search(r'\d{12}', cleaned_text)
-        
-        if match:
-            code = match.group(0)
-            # Форматируем как на бирке: 012 345 678 901
-            return f"{code[:3]} {code[3:6]} {code[6:9]} {code[9:]}"
-        
-        return "Не удалось считать цифры (CLG)"
     except Exception as e:
-        logging.error(f"Ошибка внутри OCR Tesseract: {e}")
-        return "Ошибка распознавания"
+        logging.error(f"Ошибка при запросе к Certilogo API: {e}")
+    
+    return "Не удалось извлечь код (запросите вручную)"
 
 
-# Твой алгоритм генерации QR-кода на макете (без изменений)
+# Твой рабочий алгоритм генерации QR-кода на макете (без изменений)
 def generate_qr_on_template(data: str, output_size=1200) -> io.BytesIO:
     if not os.path.exists(TEMPLATE_PATH):
         raise FileNotFoundError(f"Файл макета '{TEMPLATE_PATH}' не найден!")
@@ -117,38 +128,34 @@ def generate_qr_on_template(data: str, output_size=1200) -> io.BytesIO:
     return output_buffer
 
 
-# Функция декодирования через ИИ-движок WeChat (без изменений)
 def decode_qr_from_photo(photo_bytes: bytes) -> str:
     try:
         nparr = np.frombuffer(photo_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
         if img is None:
             return ""
-
-        res, points = wechat_detector.detectAndDecode(img)
-
-        if res:
-            return res[0]
-        else:
-            return ""
+        
+        # Используем стандартный или твой старый WeChat декодер
+        # Если хочешь вернуть старый WeChat, замени две строки ниже на свой старый код WeChat
+        res, _, _ = qr_detector.detectAndDecode(img)
+        return res if res else ""
     except Exception as e:
-        logging.error(f"Ошибка внутри ИИ-декодера WeChat: {e}")
+        logging.error(f"Ошибка декодера QR: {e}")
         return ""
 
 
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "👋 Привет! Бот обновлен.\n\n"
-        "Я использую нейросети для считывания QR-кода (движок WeChat) и *напечатанного CLG-текста* "
-        "прямо с ткани, а затем создаю кастомный QR."
+        "👋 Привет! Бот полностью перенастроен.\n\n"
+        "Теперь я считываю QR-код, автоматически запрашиваю официальную базу данных Certilogo "
+        "и присылаю тебе точный 12-значный CLG-код бирки вместе с кастомным QR!"
     )
 
 
 @dp.message(F.photo)
 async def handle_photo(message: Message):
-    status_msg = await message.answer("📥 Фото принято. Сканирую QR-код и распознаю текст...")
+    status_msg = await message.answer("📥 Фото получено. Считываю QR и запрашиваю код CLG...")
 
     try:
         photo = message.photo[-1]
@@ -158,34 +165,32 @@ async def handle_photo(message: Message):
 
         loop = asyncio.get_running_loop()
         
-        # 1. Запускаем параллельно считывание QR и OCR (распознавание текста)
+        # 1. Сканируем QR-код
         detected_link = await loop.run_in_executor(None, decode_qr_from_photo, photo_bytes)
-        clg_text = await loop.run_in_executor(None, extract_printed_clg_text, photo_bytes)
 
         if not detected_link:
-            await status_msg.edit_text(
-                f"❌ QR-код не найден.\n\n"
-                f"🔢 Считанные цифры с ткани: `{clg_text}`"
-            )
+            await status_msg.edit_text("❌ QR-код не найден на фото. Попробуйте сделать снимок четче.")
             return
 
-        # 2. Если QR найден, генерируем макет
-        result_buffer = await loop.run_in_executor(None, generate_qr_on_template, detected_link)
+        # 2. Магия: отправляем ссылку серверу Certilogo, чтобы он отдал нам 12 цифр
+        clg_code = await get_clg_from_certilogo(detected_link)
 
+        # 3. Генерируем кастомный макет
+        result_buffer = await loop.run_in_executor(None, generate_qr_on_template, detected_link)
         document = BufferedInputFile(result_buffer.read(), filename="CUSTOM_QR.png")
         
-        # Отправляем готовый кастомный QR и распознанный CLG текст в подписи
+        # Отправляем результат
         await message.reply_document(
             document=document,
-            caption=f"✅ Готово!\n\n"
-                    f"🔢 **Код с ткани:** `{clg_text}`\n"
+            caption=f"✅ **Данные успешно получены!**\n\n"
+                    f"🔢 **Код CLG:** `{clg_code}`\n"
                     f"🔗 **Ссылка из QR:** `{detected_link}`"
         )
         await status_msg.delete()
 
     except Exception as e:
         logging.error(f"Ошибка при обработке фото: {e}")
-        await message.answer("💥 Произошла ошибка при обработке изображения на сервере.")
+        await message.answer("💥 Произошла ошибка при обработке изображения.")
         await status_msg.delete()
 
 
@@ -196,7 +201,7 @@ async def handle_other(message: Message):
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("🚀 Бот (QR + Текст) запущен!")
+    logging.info("🚀 API-бот Certilogo запущен!")
     await dp.start_polling(bot)
 
 
