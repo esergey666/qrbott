@@ -35,15 +35,16 @@ TEMPLATE_PATH = "maket.jpg"
 wechat_detector = cv2.wechat_qrcode_WeChatQRCode()
 
 
-def crop_and_ocr_clg(img, points) -> str:
+def crop_and_ocr_clg(img, points):
     """
     Стабильно извлекает координаты QR-кода, аккуратно вырезает 
     строку с CLG над ним и распознает цифры через Tesseract.
+    Возвращает кортеж: (распознанный_код, байты_картинки_кропа)
     """
     try:
         h, w, _ = img.shape
         
-        # WeChat возвращает список массивов. Переводим в плоский массив точек int
+        # Переводим в плоский массив точек int
         pts = np.array(points[0]).reshape(4, 2).astype(int)
         
         # Находим крайние координаты QR-кода
@@ -55,60 +56,63 @@ def crop_and_ocr_clg(img, points) -> str:
         if qr_width <= 0:
             qr_width = 200
 
-        # Вычисляем зону строго над QR-кодом
-        # Поднимаемся вверх на 55% от ширины QR и берем ширину с запасом 20% вбок
-        crop_top = max(0, min_y - int(qr_width * 0.55))
-        crop_bottom = max(0, min_y - int(qr_width * 0.05)) # Чуть выше рамки QR
-        crop_left = max(0, min_x - int(qr_width * 0.2))
-        crop_right = min(w, max_x + int(qr_width * 0.2))
+        # --- ИСПРАВЛЕНА ГЕОМЕТРИЯ КРОПА ---
+        # Сжимаем рамку по вертикали (от -0.28 до -0.05 от ширины QR), 
+        # чтобы зацепить только строку с CLG и отрезать верхние надписи "Check authenticity"
+        crop_top = max(0, min_y - int(qr_width * 0.28))
+        crop_bottom = max(0, min_y - int(qr_width * 0.05)) 
+        crop_left = max(0, min_x - int(qr_width * 0.15))
+        crop_right = min(w, max_x + int(qr_width * 0.15))
         
-        # Проверка на корректность получившихся координат
         if crop_bottom <= crop_top or crop_right <= crop_left:
-            return "Ошибка позиционирования кода"
+            return "Ошибка позиционирования кода", None
             
-        # Вырезаем область (Region of Interest)
+        # Вырезаем область текста CLG
         roi = img[crop_top:crop_bottom, crop_left:crop_right]
         
-        # --- ПРЕДОБРАБОТКА ИЗОБРАЖЕНИЯ ДЛЯ СТАБИЛЬНОГО OCR ---
+        # --- ПОДГОТОВКА ИЗОБРАЖЕНИЯ ---
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         
-        # Увеличиваем картинку в 3 раза (Tesseract любит крупные шрифты)
+        # Увеличиваем картинку в 3 раза
         resized = cv2.resize(gray, (0, 0), fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
         
-        # Легкое размытие, чтобы сгладить текстуру ткани
-        blurred = cv2.GaussianBlur(resized, (5, 5), 0)
+        # Легкое размытие для сглаживания текстуры нитей ткани
+        blurred = cv2.GaussianBlur(resized, (3, 3), 0)
         
-        # Адаптивный ЧБ фильтр: убирает перепады света и тени
+        # Адаптивный ЧБ фильтр Гаусса для выравнивания теней
         thresh = cv2.adaptiveThreshold(
             blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
             cv2.THRESH_BINARY, 11, 2
         )
         
-        # Конфигурация Tesseract: psm 7 (поиск одной строки текста)
+        # Сохраняем обработанный кроп в байты для отладки
+        _, encoded_img = cv2.imencode('.png', thresh)
+        crop_bytes = bytes(encoded_img)
+        
+        # Конфигурация Tesseract: psm 7 (одна строка текста)
         custom_config = r'--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789'
         text = pytesseract.image_to_string(thresh, config=custom_config)
         
-        # Очищаем результат от пробелов и мусора
         cleaned = re.sub(r'\s+', '', text)
         
         # Поиск 12 цифр подряд
         match = re.search(r'\d{12}', cleaned)
         if match:
             code = match.group(0)
-            return f"{code[:3]} {code[3:6]} {code[6:9]} {code[9:]}"
+            return f"{code[:3]} {code[3:6]} {code[6:9]} {code[9:]}", crop_bytes
             
-        # Резервный вариант: если цифры разбились пробелами, собираем всё что нашли
+        # Резервный вариант: собираем вообще все цифры из вырезанной строки
         digits_only = ''.join(filter(str.isdigit, cleaned))
         if len(digits_only) == 12:
-            return f"{digits_only[:3]} {digits_only[3:6]} {digits_only[6:9]} {digits_only[9:]}"
+            return f"{digits_only[:3]} {digits_only[3:6]} {digits_only[6:9]} {digits_only[9:]}", crop_bytes
         elif len(digits_only) >= 10:
-            return f"Частично: {digits_only}"
+            return f"Частично: {digits_only}", crop_bytes
             
-        return "Не удалось считать цифры над QR"
+        return "Не удалось считать цифры над QR", crop_bytes
         
     except Exception as e:
         logging.error(f"Ошибка в блоке кропа/OCR: {e}")
-        return "Ошибка обработки текста"
+        return "Ошибка обработки текста", None
 
 
 # Алгоритм генерации QR (без изменений)
@@ -161,9 +165,17 @@ async def handle_photo(message: Message):
 
         detected_link = res[0]
 
-        # Безопасный запуск OCR в фоновом потоке, чтобы бот не зависал
+        # Запускаем обновленный OCR (возвращает код и картинку кропа)
         loop = asyncio.get_running_loop()
-        clg_code = await loop.run_in_executor(None, crop_and_ocr_clg, img, points)
+        clg_code, crop_img_bytes = await loop.run_in_executor(None, crop_and_ocr_clg, img, points)
+
+        # Отладочный шаг: отправляем вырезанную ЧБ зону тебе в чат
+        if crop_img_bytes:
+            debug_crop = BufferedInputFile(crop_img_bytes, filename="ocr_zone.png")
+            await message.reply_photo(
+                photo=debug_crop, 
+                caption="🔍 Вот эту зону над QR-кодом бот вырезал и отправил в Tesseract"
+            )
 
         # Генерируем кастомный QR
         result_buffer = await loop.run_in_executor(None, generate_qr_on_template, detected_link)
