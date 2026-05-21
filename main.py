@@ -30,7 +30,7 @@ from aiogram.types import Message, BufferedInputFile
 from aiogram.filters import CommandStart
 
 # Токен автоматически подтягивается из панели управления Bothost (Переменные окружения)
-TOKEN = os.getenv("BOT_TOKEN")
+TOKEN = os.getenv("API_TOKEN")
 
 if not TOKEN:
     logging.error("⚠️ ВНИМАНИЕ: Переменная окружения BOT_TOKEN не найдена! Проверьте настройки хостинга.")
